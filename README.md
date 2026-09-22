@@ -4,8 +4,7 @@ A collection of tools for building on [laya-mlx](laya-mlx/vendor) and
 [SemIf](Semif/vendor). Both source projects are vendored as git submodules
 (`laya-mlx/vendor`, `Semif/vendor`), pinned to the revisions the tools were
 tuned against and installed as editable sources by each sub dir's
-`pyproject.toml` — a single checkout is self-contained, no sibling
-checkouts needed.
+`pyproject.toml`.
 
 ## Prerequisites
 
