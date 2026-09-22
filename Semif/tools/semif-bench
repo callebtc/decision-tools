@@ -1,0 +1,253 @@
+#!/usr/bin/env -S uv run --script
+"""Benchmark SemIf local scoring on Apple Silicon. Run: ./tools/semif-bench [--iterations N]
+
+Port of laya-mlx's tools/laya-bench. Three workloads cover the readout modes:
+direct (one decision, one forward pass), and shared (many decisions over one
+exact state: one prefill, batched suffixes). Latency is the scorer's own
+end-to-end total (encode, prefill, suffix forward, readout); MLX is lazy, so
+the scorer synchronizes GPU completion inside every timed sample.
+"""
+
+import argparse
+import statistics
+import subprocess
+import sys
+
+import mlx.core as mx
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
+                            TimeElapsedColumn)
+from rich.table import Table
+
+from semif_phase1 import mlx_backend
+from semif_phase1.direct import encode_prompt
+
+MODEL = "Qwen/Qwen3.5-4B"
+REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+
+QUESTIONS = [
+    {
+        "id": "topic",
+        "question": "Which category does this text belong to?",
+        "options": [
+            {"id": "billing", "description": "Billing and payment support."},
+            {"id": "technical", "description": "Technical support."},
+            {"id": "sales", "description": "Sales and product evaluation."},
+            {"id": "other", "description": "Anything else."},
+        ],
+    },
+    {
+        "id": "urgent",
+        "question": "How urgent is this text?",
+        "options": [
+            {"id": "not_urgent", "description": "Not urgent."},
+            {"id": "soon", "description": "Should be handled soon."},
+            {"id": "critical", "description": "Critical."},
+        ],
+    },
+    {
+        "id": "actionable",
+        "question": "Does this text request a concrete action?",
+        "options": [
+            {"id": "no", "description": "No action is requested."},
+            {"id": "unclear", "description": "The evidence is unclear."},
+            {"id": "yes", "description": "A concrete action is requested."},
+        ],
+    },
+]
+
+SHORT_STATE = (
+    "Customer writes: my invoice shows a duplicate charge from Saturday and "
+    "the reset email never arrived. Please refund one charge and let me back in."
+)
+
+FILLER = (
+    "The quarterly infrastructure review covered replica lag on the billing cluster, "
+    "the failed reindex job from Tuesday, and the pending migration of the invoice "
+    "pipeline to the new queue workers. Customers in the EU region reported duplicate "
+    "charges during the weekend window, and support escalated two tickets to engineering."
+)
+
+
+def sysctl(name: str) -> str:
+    try:
+        return subprocess.run(
+            ["sysctl", "-n", name], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except Exception:
+        return "?"
+
+
+def machine_info() -> dict:
+    info = {}
+    try:
+        info["device"] = mx.device_info()["device_name"]
+    except Exception:
+        info["device"] = sysctl("machdep.cpu.brand_string")
+    try:
+        info["memory"] = f"{int(sysctl('hw.memsize')) / 1024**3:.0f} GiB"
+    except Exception:
+        info["memory"] = "?"
+    return info
+
+
+def percentile(samples: list[float], q: float) -> float:
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo, hi = int(pos), min(int(pos) + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def token_count(tokenizer, state: str) -> int:
+    row = {**QUESTIONS[0], "state": state}
+    return len(encode_prompt(tokenizer, row, 10**9)[0])
+
+
+def build_long_state(tokenizer, budget: int) -> str:
+    """Repeat the filler until a full decision prompt nearly fills the budget.
+
+    The probe question is the shortest of the three, so every workload row
+    stays under the scorer's max_tokens when the probe fits.
+    """
+    filler = FILLER + "\n\n"
+    base = token_count(tokenizer, filler)
+    reps = max(1, budget // base)
+    while token_count(tokenizer, filler * (reps + 1)) <= budget:
+        reps += 1
+    while reps > 1 and token_count(tokenizer, filler * reps) > budget:
+        reps -= 1
+    return filler * reps
+
+
+def run_direct(model, tokenizer, metadata, row, max_tokens):
+    result = mlx_backend.score(model, tokenizer, row, metadata, max_tokens)
+    return result["total_seconds"], result["input_tokens"]
+
+
+def run_shared(model, tokenizer, metadata, state, max_tokens):
+    rows = [{**question, "state": state} for question in QUESTIONS]
+    _, timing = mlx_backend.score_shared(model, tokenizer, rows, metadata, max_tokens)
+    # What the GPU actually evaluated: one prefill plus every real suffix token.
+    tokens = timing["prefix_tokens"] + timing["true_suffix_tokens"]
+    return timing["total_seconds"], tokens
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--revision", default=REVISION)
+    parser.add_argument("--iterations", type=int, default=15)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--max-tokens", type=int, default=4096,
+                        help="Prompt budget; long ctx fills this minus suffix headroom")
+    args = parser.parse_args()
+
+    console = Console()
+    info = machine_info()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=24),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        load_task = progress.add_task("Loading checkpoint", total=None)
+        model, tokenizer, metadata = mlx_backend.load_model(args.model, args.revision)
+        progress.update(load_task, completed=True)
+
+        long_budget = args.max_tokens - 256  # headroom for the longest suffix
+        long_state = build_long_state(tokenizer, long_budget)
+        direct_row = {**QUESTIONS[0], "state": SHORT_STATE}
+
+        workloads = [
+            ("direct · 1 question · short ctx",
+             lambda: run_direct(model, tokenizer, metadata, direct_row, args.max_tokens)),
+            ("shared · 3 questions · short ctx",
+             lambda: run_shared(model, tokenizer, metadata, SHORT_STATE, args.max_tokens)),
+            ("shared · 3 questions · long ctx",
+             lambda: run_shared(model, tokenizer, metadata, long_state, args.max_tokens)),
+        ]
+
+        warm = progress.add_task("Warmup", total=len(workloads) * args.warmup)
+        for _ in range(args.warmup):
+            for _, run in workloads:
+                run()
+                progress.advance(warm)
+        progress.update(warm, completed=True)
+
+        results = []
+        for name, run in workloads:
+            task = progress.add_task(f"Benching {name}", total=args.iterations)
+            samples = []
+            tokens = 0
+            for _ in range(args.iterations):
+                seconds, tokens = run()
+                samples.append(seconds)
+                progress.advance(task)
+            results.append({"name": name, "tokens": tokens, "samples": samples})
+
+    peak = 0
+    try:
+        peak = mx.get_peak_memory() / 1024**2
+    except Exception:
+        pass
+
+    console.print()
+    title = f"SemIf local benchmark — {info['device']}, {info['memory']} unified memory"
+    console.print(Panel.fit(
+        f"[bold]{title}[/]\n"
+        f"model [cyan]{args.model}[/] · backend [cyan]mlx[/] · "
+        f"{args.iterations} timed iterations per workload",
+        border_style="bright_magenta",
+    ))
+
+    table = Table(
+        title="Scoring throughput — 0 output tokens by design; tokens/s = input tokens evaluated",
+        title_justify="left",
+    )
+    table.add_column("Workload")
+    for col in ("tokens/req", "P50", "P95", "req/s", "tok/s"):
+        table.add_column(col, justify="right")
+    table.add_column("vs best", justify="left")
+    best = max(r["tokens"] / statistics.mean(r["samples"]) for r in results)
+
+    for r in results:
+        mean_s = statistics.mean(r["samples"])
+        rps = 1 / mean_s
+        tps = r["tokens"] / mean_s
+        bar_len = round(12 * tps / best)
+        bar = f"[bright_green]{'█' * bar_len}[/]{'░' * (12 - bar_len)}"
+        table.add_row(
+            r["name"],
+            f"{r['tokens']:,}",
+            f"{percentile(r['samples'], 0.50) * 1000:.1f} ms",
+            f"{percentile(r['samples'], 0.95) * 1000:.1f} ms",
+            f"{rps:.1f}",
+            f"{tps:,.0f}",
+            bar,
+        )
+    console.print(table)
+
+    console.print(
+        Panel.fit(
+            f"[dim]direct = one decision per forward pass; shared = one state prefill plus\n"
+            f"batched question suffixes (all decisions over one exact state).\n"
+            f"Latency is the scorer's end-to-end total: encode, prefill, suffix forward,\n"
+            f"GPU sync, and CPU readout. Shared amortizes the prefill across questions;\n"
+            f"long contexts amortize fixed overhead across more evaluated tokens.\n"
+            f"Option probabilities are conditional scores, uncalibrated as confidence.\n"
+            f"Allocator cache is capped at 256 MiB by the backend. Peak Metal memory\n"
+            f"observed: {peak / 1024:.1f} GiB[/dim]",
+            border_style="dim",
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

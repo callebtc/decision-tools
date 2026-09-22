@@ -1,0 +1,13 @@
+[project]
+name = "semif-tools"
+version = "0.1.0"
+description = "Decision tools built on SemIf: is-safe, semif-bench, semif-agent"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "semif-phase1[mlx]",
+  "rich>=13",
+  "playwright>=1.49",
+]
+
+[tool.uv.sources]
+semif-phase1 = { path = "../../Semif", editable = true }

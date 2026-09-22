@@ -1,0 +1,857 @@
+#!/usr/bin/env -S uv run --script
+"""A local web agent with a dynamic, indexed action space. Run: ./tools/semif-agent --demo
+
+SemIf's port of the jev-ultrafast loop: every page observation produces an
+indexed element table; ONE SemIf shared-mode pass per cycle picks the
+operation (CLICK/TYPE_TEXT/SELECT/WAIT/DONE/BLOCKED) plus speculative target
+heads over only the compatible elements; a local Qwen3.5-4B writes text only
+when the operation is TYPE_TEXT. The verdict-carrying choices are scored from
+answer-token logits — no generation in the decision path. DONE is never
+trusted: the outcome is verified independently (--verify-text) before success.
+
+Also try any page:  ./tools/semif-agent --url URL --goal '...' --verify-text '...'
+
+Exit codes: 0 = done and verified, 1 = done but unverified, 2 = blocked/stalled,
+3 = error.
+"""
+
+import argparse
+import json
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+import mlx.core as mx
+
+from semif_phase1 import mlx_backend
+
+MODEL = "Qwen/Qwen3.5-4B"
+REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+HERE = Path(__file__).resolve().parent
+
+MAX_STEPS = 16
+MAX_ELEMENTS_PER_HEAD = 15          # SemIf allows at most 16 options per decision
+WORLD = "Local web agent operating the user's own browser toward the user's stated goal."
+
+# Cheap change detector: body text plus the values of tagged controls.
+FINGERPRINT_JS = """
+() => {
+  const parts = [document.body.innerText.replace(/\\s+/g, " ").slice(0, 400)];
+  for (const el of document.querySelectorAll("[data-semif-idx]")) {
+    parts.push(el.value !== undefined ? String(el.value).slice(0, 40) : "");
+  }
+  return parts.join("|");
+}
+"""
+
+# The snapshot tags live DOM nodes with data-semif-idx and returns the table.
+# Real sites use custom widgets, so capture WAI-ARIA controls as well as
+# native elements: combobox suggestions, menu/menuitemradio dropdowns, and
+# role=button cards and calendar cells.
+SNAPSHOT_JS = """
+() => {
+  // Re-tag every snapshot: stale data-semif-idx attributes from the previous
+  // observation would collide with fresh indices once the DOM changes.
+  for (const el of document.querySelectorAll("[data-semif-idx]")) el.removeAttribute("data-semif-idx");
+  const seen = new Set();
+  const rows = [];
+  const kinds = [
+    ["input[type='text'], input[type='search'], input[type='date'], input[type='email'], "
+     + "input[type='password'], input[type='number'], input[type='tel'], input[type='url'], input:not([type])", "textbox"],
+    ["textarea", "textbox"],
+    ["select", "select"],
+    ["[role='option'], [role='menuitem'], [role='menuitemradio']", "option"],
+    ["[role='combobox']:not(input)", "combobox"],
+    ["[role='gridcell'] [aria-label]", "cell"],
+    ["a[href]:not([href^='#'])", "link"],
+    ["button, [role='button'], input[type='button'], input[type='submit']", "button"],
+    ["a[href^='#']", "link"],
+  ];
+  outer:
+  for (const [selector, kind] of kinds) {
+    for (const el of document.querySelectorAll(selector)) {
+      if (seen.has(el)) continue;
+      const r = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      if (r.width === 0 || r.height === 0 || style.visibility === "hidden"
+          || style.display === "none" || el.disabled) continue;
+      if (el.closest("[aria-hidden='true']")) continue;
+      seen.add(el);
+      let label = el.getAttribute("aria-label") || "";
+      if (!label && el.id) { const l = document.querySelector(`label[for='${el.id}']`); if (l) label = l.innerText; }
+      if (!label) { const l = el.closest("label"); if (l && l !== el) label = l.innerText; }
+      if (!label) label = el.getAttribute("placeholder") || "";
+      if (!label) label = el.getAttribute("title") || "";
+      if (!label && kind !== "textbox") label = el.innerText;
+      // Internal path links carry the identity of what they open (e.g. a model
+      // page slug); a bare display name is ambiguous on content pages.
+      const href = el.getAttribute("href") || "";
+      if (kind === "link" && href.startsWith("/") && !href.startsWith("//")
+          && !href.startsWith("/#")) label += " → " + href.slice(0, 40);
+      label = (label || "").trim().replace(/\\s+/g, " ").slice(0, 90);
+      let value = "";
+      if (kind === "select") {
+        value = el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "";
+      } else if (el.type === "password") {
+        // The secret must not leak into prompts or traces; only filled/empty.
+        value = el.value ? "hidden" : "";
+      } else if (el.value !== undefined && el.value !== "") {
+        value = String(el.value);
+      }
+      value = value.slice(0, 40);
+      el.setAttribute("data-semif-idx", String(rows.length));
+      const row = { index: rows.length, kind, label: label || el.name || el.id || kind, value };
+      const aria = el.getAttribute("aria-selected") || el.getAttribute("aria-checked") || "";
+      if (aria) row.aria_state = aria;
+      if (kind === "select") row.options = Array.from(el.options).slice(0, 16).map(o => o.text.trim().slice(0, 40));
+      if (kind === "textbox" && (el.getAttribute("role") === "combobox" || el.getAttribute("aria-autocomplete"))) {
+        row.suggests = true;   // typing opens a suggestion list: press Enter to take the top one
+      }
+      if (el.tagName === "INPUT" && el.type && el.type !== "text") row.input_type = el.type;
+      // Head ranking inputs: chrome landmarks and same-page anchors are real
+      // but rarely the task target; content-area controls must win the capped
+      // head slots first (measured: rankings rows lost every slot to nav).
+      if (el.closest("header, nav, footer")) row.in_chrome = true;
+      if (href.startsWith("#")) row.anchor = true;
+      if (kind === "link" && href.startsWith("/") && !href.startsWith("//")) row.href = href.slice(0, 60);
+      rows.push(row);
+      if (rows.length >= 120) break outer;
+    }
+  }
+      return {
+        title: document.title, heading: (document.querySelector("h1") || {}).innerText || "",
+        url: location.pathname.slice(0, 80),
+        // Visible text is the evidence of outcomes (results, errors, articles);
+        // controls alone cannot show that the goal has been reached. Prefer the
+        // main content: on app shells the nav chrome eats the whole budget while
+        // the dialog or page body stays invisible (measured).
+        text: ((document.querySelector("main") && document.querySelector("main").innerText.trim().length >= 200)
+               ? document.querySelector("main").innerText
+               : document.body.innerText).replace(/\\s+/g, " ").slice(0, 2600),
+        elements: rows,
+      };
+}
+"""
+
+OPERATIONS = [
+    {"id": "CLICK", "description": "Click a button or link to progress toward the goal."},
+    {"id": "TYPE_TEXT", "description": "Type text into a textbox whose value is wrong or empty; the text is written separately."},
+    {"id": "SELECT", "description": "Choose an option in a dropdown whose current value is wrong for the goal."},
+    {"id": "WAIT", "description": "The page is still loading or busy; wait briefly for it to settle."},
+    {"id": "BACK", "description": "The current page is not useful for the goal; navigate back to the previous page."},
+    {"id": "DONE", "description": "The goal's final outcome is fully visible on the page (not merely a filled form); it will be verified independently."},
+    {"id": "BLOCKED", "description": "Stop because the goal is truly impossible (e.g. a CAPTCHA, paywall, or "
+                                    "email verification blocks it); never stop while a form can still be "
+                                    "filled or corrected, or while another element can be clicked."},
+]
+
+CLICK_KINDS = ("button", "link", "combobox", "option", "cell")
+CLICK_LINK_KINDS = ("link",)          # destinations: which page to open
+CLICK_CONTROL_KINDS = ("button", "combobox", "option", "cell")   # widgets on this page
+CLICK_QUESTION = "Which element should receive the CLICK?"
+# Links that open new tabs are invisible to a single-tab agent: the click
+# "does nothing" and the agent loops (measured: OpenRouter model rows use
+# target=_blank). Retarget them in-page so the navigation is observable.
+RETARGET_JS = """idx => {
+  const el = document.querySelector(`[data-semif-idx='${idx}']`);
+  if (el && el.tagName === 'A' && el.target && el.target !== '_self') {
+    el.target = '_self'; return true;
+  }
+  return false;
+}"""
+SELECT_KINDS = ("select",)
+SELECT_QUESTION = "Which dropdown should an option be chosen in?"
+TYPE_KINDS = ("textbox",)
+# TYPE_TEXT is value-first: the text is generated from the goal first, then
+# the target question names the value ("Which textbox should 'Zurich' go
+# into?"). A speculative type head — picking the field before the value —
+# looped deterministically on the wrong field (a measured failure).
+
+
+def snapshot(page, tries=5):
+    """SPAs navigate mid-observation ("execution context destroyed"); a racing
+    observation is a retry, not a crash (measured)."""
+    for attempt in range(tries):
+        try:
+            return page.evaluate(SNAPSHOT_JS)
+        except Exception:
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(400)
+    raise RuntimeError("snapshot failed: the page kept navigating")
+
+
+def fingerprint(page, tries=5):
+    for attempt in range(tries):
+        try:
+            return page.evaluate(FINGERPRINT_JS)
+        except Exception:
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(400)
+    raise RuntimeError("fingerprint failed: the page kept navigating")
+
+
+def element_desc(e):
+    """Compact one-line element description, shared by state and head options
+    (JSON dicts with repeated keys blew the 4096-token decision limit once
+    element counts hit ~120, measured)."""
+    kind = e.get("input_type") or e["kind"]
+    d = f"[{e['index']}] {kind} {e['label']}"
+    v = e.get("value") or ""
+    if v or e["kind"] in ("textbox", "select"):
+        d += f" · {v or 'empty'}"
+    if e.get("aria_state"):
+        d += f" · {e['aria_state']}"
+    return d
+
+
+def head_row(state, head, question, elements):
+    """One target head over only its compatible elements (SemIf needs >= 2 options)."""
+    options = [{"id": str(e["index"]), "description": element_desc(e)} for e in elements]
+    return {"id": head, "state": state, "question": question, "options": options}
+
+
+def build_state(goal, snap, note=None, history=()):
+    state = {
+        "goal": goal,
+        "page": {"title": snap["title"], "heading": snap["heading"],
+                 "url": snap.get("url", ""), "text": snap["text"]},
+        "elements": [element_desc(e) for e in snap["elements"][:80]],
+        # The decision layer is stateless scoring; the recent-action history is
+        # its memory. Without it a 4B model cannot tell "first attempt" from
+        # "fourth identical attempt" and loops (measured).
+        "recent_actions": list(history),
+    }
+    if note:
+        state["note"] = note
+    return state
+
+
+def _greedy_json(model, tokenizer, system, user, max_tokens=64):
+    """Greedy JSON generation with an early '}' exit; returns (value, raw)."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False,
+                                           add_generation_prompt=True, enable_thinking=False)
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    cache = make_prompt_cache(model)
+    logits = model(mx.array([ids]), cache=cache)
+    out = []
+    for _ in range(max_tokens):
+        token = mx.argmax(logits[0, -1]).item()
+        out.append(token)
+        if token in (tokenizer.eos_token_id,):
+            break
+        text = tokenizer.decode(out)
+        if text.rstrip().endswith("}") and text.count("{") >= 1 and "}" in text:
+            break
+        logits = model(mx.array([[token]]), cache=cache)
+    text = tokenizer.decode(out)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None, text
+    try:
+        value = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None, text
+    key = "text" if "text" in value else ("report" if "report" in value else None)
+    return (value[key].strip() if key and isinstance(value[key], str) else None), text
+
+
+def generate_text(model, tokenizer, goal, field, table, history=(), note=None, run_id=None,
+                  max_tokens=64):
+    """The only generative step in the action loop: one field value as strict
+    JSON. Greedy decoding makes invented values (credentials) identical across
+    runs; the run_id de-duplicates them at the prompt level."""
+    payload = json.dumps({"goal": goal, "field_to_fill": field,
+                           "note": note or "none",
+                           "recent_actions": list(history[-6:]),
+                           "run_id": run_id or "",
+                           "visible_elements": [f"[{e['index']}] {e.get('input_type') or e['kind']} "
+                                                f"{e['label']} · {e.get('value') or 'empty'}"
+                                                for e in table]}, ensure_ascii=False)
+    system = ("You fill one form field for a web agent. Respond with only a small JSON "
+              "object like {\"text\": \"London\"}. No explanation, no markdown. "
+              "Write the exact value the field needs: match the formats the page itself "
+              "shows (e.g. how a date field or nearby text formats dates), and for a "
+              "place use the name the site itself would match it by. Never rewrite a "
+              "field that already shows its correct goal value; write the value for "
+              "the field that is still wrong or empty. If the goal requires values "
+              "that do not exist yet (e.g. credentials for a new account), invent "
+              "plausible simple ones and reuse them consistently (a confirm-password "
+              "field gets the exact password already typed, see recent actions). "
+              "Values that must be unique (a new username or email) must include "
+              "the given run_id so they are fresh. If the note reports a rejected "
+              "submit or an error, write a DIFFERENT value than before.")
+    return _greedy_json(model, tokenizer, system, payload, max_tokens)
+
+
+def generate_report(model, tokenizer, goal, actions, pages):
+    """The agent's only voice: one constrained generation at the end of a
+    finished run, over the FULL action log and the pages visited. The state
+    window (8 actions) is a decision budget; reporting must not be amputated
+    by it (read-and-report tasks drop their early findings otherwise)."""
+    payload = json.dumps({"goal": goal,
+                           "actions": list(actions),
+                           "pages_visited": [{"url": u, "text": t} for u, t in pages]},
+                          ensure_ascii=False)
+    system = ("A web agent has finished its task. From the goal, the full action log, "
+              "and the pages visited, write the final answer the goal asks to report. "
+              "Respond with only a small JSON object like {\"report\": \"...\"}. State "
+              "values exactly as they appeared on the pages (names, ids, slugs, "
+              "numbers). Cover every part of the goal. No markdown. Use ONLY facts "
+              "visible in the pages visited or the action log: if a required value "
+              "was never actually seen on a visited page, write MISSING for it "
+              "instead of inventing it.")
+    return _greedy_json(model, tokenizer, system, payload, max_tokens=128)
+
+
+def verify(page, verify_re):
+    """Search the FULL body text: results evidence (connection cards, article
+    bodies) is often far below the page header, beyond the snapshot's 1200-char
+    state view (measured)."""
+    text = re.sub(r"\s+", " ", page.evaluate("() => document.body.innerText"))
+    return verify_re.search(text[:30000]) is not None
+
+
+def page_text(page, tries=5):
+    """The snapshot's text view: collapsed whitespace, capped. Comparisons read
+    the page through this one normalization. Navigation races ("execution
+    context destroyed", null body mid-load) are retries,     not crashes (measured on
+    openrouter)."""
+    for _ in range(tries):
+        try:
+            return re.sub(r"\s+", " ", page.evaluate("() => document.body.innerText"))[:1200]
+        except Exception:
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(300)
+    return ""
+
+
+def accept_consent(page):
+    """Cookie consent is not part of any task; clear it directly. Generic GDPR
+    banner handling: click the first prominent accept-all button, in any of
+    the common label languages."""
+    pattern = re.compile(r"accept all|alle akzeptieren|alles akzeptieren|alle zulassen|"
+                         r"accepter tout|agree to all|^accept$|^akzeptieren$|^zustimmen$", re.I)
+    try:
+        for btn in page.locator("button, [role='button']").all()[:40]:
+            name = ((btn.inner_text() or "") + " " +
+                    (btn.get_attribute("aria-label") or "")).strip()
+            if pattern.search(name):
+                btn.click(timeout=2000)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(1000)
+                return
+    except Exception:
+        pass
+
+
+def wait_for_useful_state(page, before_text, budget_ms=1500):
+    """jev-ultrafast lesson: after acting, wait until the page text actually
+    changes (capped), instead of re-deciding on a stale identical state."""
+    waited = 0
+    while waited < budget_ms:
+        page.wait_for_timeout(100)
+        waited += 100
+        if page_text(page) != before_text:
+            return True
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--demo", action="store_true", help="Run the built-in local flight-search task")
+    parser.add_argument("--url")
+    parser.add_argument("--goal")
+    parser.add_argument("--verify-text", help="Regex the page body must match after DONE")
+    parser.add_argument("--verify-report", dest="verify_report",
+                        help="Regex the final report must satisfy (read-and-report goals); "
+                             "DONE is rejected until it does")
+    parser.add_argument("--trace", type=Path, help="Write the full run trace (create-only JSON)")
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--revision", default=REVISION)
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--headed", action="store_true")
+    parser.add_argument("--snapshot-only", action="store_true",
+                        help="Print the element table for the page and exit (no model calls)")
+    args = parser.parse_args()
+
+    if args.demo:
+        args.url = (HERE / "semif-agent-demo.html").as_uri()
+        args.goal = ("Search one-way flights from Zurich to London on 2026-09-20 for one adult "
+                     "in economy. DONE when matching flight options are visible.")
+        args.verify_text = args.verify_text or "Zurich → London.*2026-09-20.*One way.*flights found"
+    if not args.url:
+        parser.error("--url is required (or use --demo)")
+    if args.snapshot_only:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(channel="chrome", headless=not args.headed)
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            page.goto(args.url)
+            accept_consent(page)
+            page.goto(args.url)
+            page.wait_for_timeout(4000)
+            snap = snapshot(page)
+            print(json.dumps(snap, indent=1))
+            browser.close()
+        return 0
+    if not args.goal:
+        parser.error("--goal is required (or use --demo)")
+    try:
+        # Compile early: a bad pattern must fail before the browser opens, not
+        # mid-run at the first DONE (measured: a mid-pattern (?i) crashed a run
+        # 12 cycles in).
+        verify_re = re.compile(args.verify_text) if args.verify_text else None
+    except re.error as e:
+        parser.error(f"--verify-text is not a valid regex: {e}")
+    try:
+        report_re = re.compile(args.verify_report) if args.verify_report else None
+    except re.error as e:
+        parser.error(f"--verify-report is not a valid regex: {e}")
+    if args.trace is not None and args.trace.exists():
+        print(f"trace path exists: {args.trace}", file=sys.stderr)
+        return 3
+
+    from playwright.sync_api import sync_playwright
+
+    started = time.perf_counter()
+    model, tokenizer, metadata = mlx_backend.load_model(args.model, args.revision)
+    load_s = time.perf_counter() - started
+    trace = {"model": {"source": args.model, "revision": args.revision},
+             "goal": args.goal, "url": args.url, "load_seconds": round(load_s, 2), "cycles": []}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(channel="chrome", headless=not args.headed)
+        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        page.goto(args.url)
+        page.wait_for_load_state("domcontentloaded")
+        entry_url = page.url
+        accept_consent(page)
+        if page.url != entry_url:
+            # A consent interstitial navigated away; return to the task page.
+            page.goto(args.url)
+            page.wait_for_load_state("domcontentloaded")
+
+        status, chosen_op = "error", None
+        note = None
+        history = []                  # rolling action memory fed back into state
+        full_history = []             # untrimmed log for the end-of-run report
+        seen_pages = []               # distinct pages visited: (url, text digest)
+        prev_sig = None               # (op, target, text) of the last executed action
+        recent_sigs = []              # window for detecting multi-step action cycles
+        verify_failures = 0
+        blocked_strikes = 0
+        no_action_strikes = 0
+        run_id = str(random.randint(1000, 9999))   # fresh invented values per run
+        page.wait_for_timeout(2500)   # let the SPA render its form controls
+        accept_consent(page)             # banners often render only after the SPA settles
+        prev_fingerprint = fingerprint(page)
+        for step in range(args.max_steps):
+            cycle = {"step": step}
+            trace["cycles"].append(cycle)
+            mark = time.perf_counter()
+            snap = snapshot(page)
+            cycle["snapshot_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+            cycle["url"] = snap.get("url", "")
+            cycle["elements"] = snap["elements"]
+            cycle["page_text"] = snap["text"]      # what the scorer actually saw
+            # Reading memory for the end-of-run report: keep the richest digest
+            # per URL (latest state), in visit order. SPAs swap content without
+            # changing the URL — the digest must refresh every cycle or the
+            # report only ever sees the first state of a page (measured).
+            if seen_pages and seen_pages[-1][0] == snap["url"]:
+                seen_pages[-1][1] = snap["text"][:2600]
+            else:
+                seen_pages[:] = [p for p in seen_pages if p[0] != snap["url"]]
+                seen_pages.append([snap["url"], snap["text"][:2600]])
+                del seen_pages[:-12]
+            state = build_state(args.goal, snap, note, history)
+
+            rows = [{"id": "operation", "state": state,
+                     "question": f"Which operation should the web agent perform next? {WORLD}",
+                     "options": OPERATIONS}]
+            heads = {}
+            # Capped head slots go to main-content controls first; suggestion
+            # options, chrome landmarks, same-page anchors, and section-relative
+            # links fill the remainder (content rows lost every slot otherwise,
+            # measured on OpenRouter rankings). Identical labels are
+            # deduped (widget toolbars repeat "Information"/"Absolute" x5+).
+            cur_url = snap.get("url") or ""
+
+            def _rank(e):
+                href = e.get("href") or ""
+                section_relative = (cur_url and cur_url != "/" and href
+                                    and (href == cur_url or href.startswith(cur_url + "/")))
+                # Single-segment links are section/landing roots:
+                # real but shallow targets; deeper resource links win window 1.
+                landing = e["kind"] == "link" and href.startswith("/") and href.count("/") == 1
+                return 1 if (e["kind"] == "option" or e.get("in_chrome") or e.get("anchor")
+                             or section_relative or landing) else 0
+
+            def build(kind_filter, question, head_names):
+                seen_label = {}
+                elems = []
+                for e in sorted((e for e in snap["elements"] if e["kind"] in kind_filter),
+                                key=_rank):
+                    key = (e["kind"], e["label"])
+                    seen_label[key] = seen_label.get(key, 0) + 1
+                    if seen_label[key] <= 2:
+                        elems.append(e)
+                windows = [elems[i:i + MAX_ELEMENTS_PER_HEAD] for i in
+                           range(0, len(elems), MAX_ELEMENTS_PER_HEAD)][:len(head_names)]
+                for name, w in zip(head_names, windows):
+                    heads[name] = w
+                    if len(w) >= 2:
+                        rows.append(head_row(state, name, question, w))
+                if not windows:
+                    heads[head_names[0]] = []
+
+            build(CLICK_LINK_KINDS, CLICK_QUESTION, ("click_link_target", "click_link_target2"))
+            build(CLICK_CONTROL_KINDS, CLICK_QUESTION, ("click_control_target",))
+            build(SELECT_KINDS, SELECT_QUESTION, ("select_target",))
+            heads["type_target"] = [e for e in snap["elements"]
+                                     if e["kind"] in TYPE_KINDS][:MAX_ELEMENTS_PER_HEAD]
+
+            mark = time.perf_counter()
+            results, timing = mlx_backend.score_shared(model, tokenizer, rows, metadata)
+            cycle["decide_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+            cycle["decide_input_tokens"] = timing["prefix_tokens"] + timing["true_suffix_tokens"]
+            by_id = {r["id"]: r for r in results}
+            op_result = by_id["operation"]
+            op = op_result["option_ids"][op_result["probabilities"].index(max(op_result["probabilities"]))]
+            chosen_op = op
+            cycle["operation"] = op
+            cycle["operation_distribution"] = dict(zip(op_result["option_ids"],
+                                                       (round(p, 3) for p in op_result["probabilities"])))
+            if op == "CLICK":
+                # The clickable space is windowed into SemIf-sized decisions
+                # (<= 16 options each): destinations (links) and controls
+                # (buttons/comboboxes) are separate decisions; all windows are
+                # scored in the same shared pass and the globally strongest
+                # choice wins.
+                names = ("click_link_target", "click_link_target2", "click_control_target")
+                window_rows = [(by_id[w], w) for w in names if w in by_id]
+                if window_rows:
+                    row, window = max(window_rows, key=lambda rw: max(rw[0]["probabilities"]))
+                    tid = row["option_ids"][row["probabilities"].index(max(row["probabilities"]))]
+                    cycle["target"] = int(tid)
+                    cycle["target_window"] = window
+                    cycle["target_distribution"] = dict(zip(row["option_ids"],
+                                                             (round(p, 3) for p in row["probabilities"])))
+                elif sum(len(heads.get(w, ())) for w in names) == 1:
+                    # Only one clickable element: the target is trivially determined.
+                    for w in names:
+                        if heads.get(w):
+                            cycle["target"] = heads[w][0]["index"]
+                            cycle["target_window"] = w
+                            cycle["target_trivial"] = True
+            elif op == "SELECT":
+                row = by_id.get("select_target")
+                if row is not None:
+                    tid = row["option_ids"][row["probabilities"].index(max(row["probabilities"]))]
+                    cycle["target"] = int(tid)
+                    cycle["target_distribution"] = dict(zip(row["option_ids"],
+                                                            (round(p, 3) for p in row["probabilities"])))
+                elif len(heads["select_target"]) == 1:
+                    cycle["target"] = heads["select_target"][0]["index"]
+                    cycle["target_trivial"] = True
+            print(f"[{step:2d}] {op:9s} target={cycle.get('target')} "
+                  f"op_p={max(op_result['probabilities']):.2f}")
+
+            mark = time.perf_counter()
+            if op == "DONE":
+                # DONE is never trusted: independent verification decides. For
+                # read-and-report goals the outcome is the ANSWER, so the page
+                # regex AND the report draft must both pass (measured: one
+                # visited model page passed the page check while the goal
+                # needed three).
+                if not verify_re and not report_re:
+                    status = "done"
+                    break
+                verified = verify(page, verify_re) if verify_re else True
+                cycle["verification"] = verified
+                if verified and report_re:
+                    draft, _ = generate_report(model, tokenizer, args.goal, full_history, seen_pages)
+                    cycle["report_draft"] = (draft or "")[:300]
+                    verified = bool(draft and report_re.search(draft))
+                if verified:
+                    trace["verified"] = True
+                    cycle["action"] = "verified"
+                    status = "done"
+                    break
+                verify_failures += 1
+                if verify_failures >= 8:
+                    cycle["action"] = "verification failed repeatedly"
+                    status = "done+unverified"
+                    break
+                if verify_re and not cycle["verification"]:
+                    note = ("DONE was chosen but independent verification failed. The page does "
+                            "not yet show the goal outcome. The verifier requires this evidence "
+                            f"on the page: /{args.verify_text}/. Continue working toward the goal.")
+                else:
+                    note = ("DONE was rejected: the final report does not yet answer the whole "
+                            f"goal. Current report draft: '{cycle.get('report_draft', '')[:220]}'. "
+                            "The draft names everything found so far. For each fact still missing, "
+                            "open the dedicated page of that exact item: click the element whose "
+                            "label EXACTLY matches it (not a similar one), read the value shown "
+                            "there, then DONE again.")
+                history.append("DONE was rejected: the goal outcome or answer is not complete yet")
+                full_history.append("DONE was rejected: the goal outcome or answer is not complete yet")
+                cycle["action"] = "verification failed; continue"
+                cycle["execute_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+                page.wait_for_timeout(120)
+                if args.headed:
+                    page.wait_for_timeout(400)
+                mx.clear_cache()
+                continue
+            elif op == "BLOCKED":
+                # Like DONE, BLOCKED is a claim; an eager 4B gives up with the
+                # form half-filled (measured). One rejection
+                # makes it look again; a repeat confirms it.
+                blocked_strikes += 1
+                if blocked_strikes >= 2:
+                    cycle["action"] = "stop (confirmed blocked)"
+                    status = "blocked"
+                    break
+                note = ("BLOCKED was rejected once: the page still offers fields and controls. "
+                        "Stop only if truly impossible (CAPTCHA, paywall, email verification). "
+                        "Look again: which field still needs a value? Which element was not clicked yet?")
+                history.append("BLOCKED was rejected: there are still actionable elements")
+                full_history.append("BLOCKED was rejected: there are still actionable elements")
+                cycle["action"] = "blocked rejected; continue"
+                cycle["execute_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+                page.wait_for_timeout(120)
+                if args.headed:
+                    page.wait_for_timeout(400)
+                mx.clear_cache()
+                continue
+            executed = False
+            if op == "WAIT":
+                page.wait_for_timeout(500)
+                cycle["action"] = "wait 500ms"
+                executed = True
+            elif op == "BACK":
+                page.go_back()
+                page.wait_for_load_state("domcontentloaded")
+                cycle["action"] = "go back"
+                executed = True
+            elif op == "TYPE_TEXT":
+                textboxes = heads["type_target"]
+                text = None
+                if textboxes:
+                    mark = time.perf_counter()
+                    text, raw = generate_text(model, tokenizer, args.goal,
+                                              ", ".join(f"[{e['index']}] {e['label']}"
+                                                        f" · {e.get('value') or 'empty'}" for e in textboxes)
+                                              or "no fields", snap["elements"], history,
+                                              note=note, run_id=run_id)
+                    cycle["generated_raw"] = raw.strip()[:200]
+                if not textboxes:
+                    # Transient (e.g. a dialog mid-render): re-decide, don't die.
+                    cycle["action"] = "no textbox to type into"
+                elif text is None or not text:
+                    cycle["action"] = "text generation failed"
+                else:
+                    cycle["text"] = text
+                    if len(textboxes) == 1:
+                        element = textboxes[0]
+                    else:
+                        # Value-first targeting: name the value in the question.
+                        row = head_row(state, "type_target",
+                                        f"Which textbox's current value is wrong or empty "
+                                        f"and should receive the text '{text[:60]}'?",
+                                        textboxes)
+                        res = mlx_backend.score(model, tokenizer, row, metadata)
+                        tid = res["option_ids"][res["probabilities"].index(max(res["probabilities"]))]
+                        cycle["target"] = int(tid)
+                        cycle["target_distribution"] = dict(zip(res["option_ids"],
+                                                                (round(p, 3) for p in res["probabilities"])))
+                        element = next(e for e in textboxes if e["index"] == cycle["target"])
+                    locator = page.locator(f"[data-semif-idx='{element['index']}']")
+                    if text == (element.get("value") or ""):
+                        # Typing the exact value a field already shows cannot change
+                        # anything; re-typing it forever is a whole loop class
+                        # (measured). Skip and report the no-op.
+                        cycle["action"] = (f"text '{text[:40]}' already present in "
+                                           f"[{element['index']}] {element['label'][:30]} (skipped)")
+                        cycle["skipped_noop"] = True
+                    elif locator.count() == 0:
+                        # The DOM re-rendered between observation and action; the
+                        # next cycle re-observes and retries (no hard block).
+                        cycle["action"] = "stale target (element disappeared; page changed)"
+                        cycle["interaction_failed"] = True
+                    else:
+                        try:
+                            locator.fill(text)
+                            if element.get("suggests"):
+                                # Combobox with suggestions: accept the top match.
+                                locator.press("Enter")
+                                cycle["action"] = f"type '{text[:40]}' + Enter into [{element['index']}] {element['label'][:30]}"
+                            else:
+                                cycle["action"] = f"type '{text[:40]}' into [{element['index']}] {element['label'][:30]}"
+                            # Generic typed-value check: did the field actually take it?
+                            after = locator.input_value()
+                            cycle["field_value_after"] = (after or "")[:40]
+                            executed = True
+                        except Exception as e:
+                            cycle["action"] = (f"type into [{element['index']}] {element['label'][:30]} "
+                                               f"failed: {type(e).__name__}")
+                            cycle["interaction_failed"] = True
+                    cycle["text_decide_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+            elif op in ("CLICK", "SELECT"):
+                if "target" not in cycle:
+                    cycle["action"] = "no compatible target"
+                else:
+                    head = (cycle.get("target_window") if op == "CLICK" else "select_target")
+                    elements = heads[head]
+                    element = next((e for e in elements if e["index"] == cycle["target"]), None)
+                    locator = page.locator(f"[data-semif-idx='{cycle['target']}']")
+                    if element is None or locator.count() == 0:
+                        # The DOM re-rendered between observation and action; the
+                        # next cycle re-observes and retries (no hard block).
+                        cycle["action"] = "stale target (element disappeared; page changed)"
+                        cycle["interaction_failed"] = True
+                    elif op == "CLICK":
+                        try:
+                            cycle["retargeted"] = bool(page.evaluate(RETARGET_JS, cycle["target"]))
+                        except Exception:
+                            pass
+                        try:
+                            locator.click(timeout=4000)
+                            cycle["action"] = f"click [{cycle['target']}] {element['label'][:40]}"
+                            executed = True
+                        except Exception:
+                            # Custom widgets are often overlay-covered; a forced
+                            # click retries without actionability checks.
+                            try:
+                                locator.click(timeout=2000, force=True)
+                                cycle["action"] = f"click [{cycle['target']}] {element['label'][:40]} (forced)"
+                                executed = True
+                            except Exception as e:
+                                cycle["action"] = f"click [{cycle['target']}] failed: {type(e).__name__}"
+                                cycle["interaction_failed"] = True
+                    else:
+                        options = element.get("options") or []
+                        if len(options) < 2:
+                            cycle["action"] = "select had no options"
+                        else:
+                            sel_row = {"id": "value", "state": state,
+                                       "question": f"Which option should be chosen in the dropdown '{element['label']}'?",
+                                       "options": [{"id": str(i), "description": o} for i, o in enumerate(options)]}
+                            res = mlx_backend.score(model, tokenizer, sel_row, metadata)
+                            choice = res["option_ids"][res["probabilities"].index(max(res["probabilities"]))]
+                            try:
+                                locator.select_option(label=options[int(choice)], timeout=2000)
+                                cycle["action"] = f"select '{options[int(choice)]}' in [{cycle['target']}]"
+                                executed = True
+                            except Exception as e:
+                                cycle["action"] = f"select in [{cycle['target']}] failed: {type(e).__name__}"
+                                cycle["interaction_failed"] = True
+            cycle["execute_ms"] = round((time.perf_counter() - mark) * 1000, 1)
+            # jev-ultrafast "wait for useful state": only navigation-like actions
+            # (CLICK, BACK) wait for the page to change; other interactions settle
+            # briefly — typed values live in the next snapshot, not in body text.
+            if op in ("CLICK", "BACK"):
+                wait_for_useful_state(page, snap["text"])
+            else:
+                page.wait_for_timeout(120)
+            sig = (op, cycle.get("target"), cycle.get("text"))
+            cycling = sig in recent_sigs
+            recent_sigs.append(sig)
+            del recent_sigs[:-4]
+            unchanged = fingerprint(page) == prev_fingerprint
+            cycle["page_changed"] = not unchanged
+            outcome = ""
+            if cycle.get("skipped_noop"):
+                outcome = " (no-op: the field already contained this text)"
+            elif cycle.get("interaction_failed"):
+                outcome = " (interaction failed)"
+            elif op == "TYPE_TEXT":
+                after_v = cycle.get("field_value_after") or ""
+                if not after_v:
+                    outcome = " (field still empty afterwards)"
+                elif after_v == cycle.get("text") and "+ Enter" in (cycle.get("action") or ""):
+                    outcome = " (typed text remains unselected in the suggestion field)"
+            elif unchanged:
+                outcome = " (page unchanged)"
+            history.append((cycle.get("action") or op) + outcome)
+            del history[:-8]
+            full_history.append((cycle.get("action") or op) + outcome)
+            del full_history[:-80]
+            # Anti-loop feedback for the next decision. The immediate check
+            # catches identical repeats; the window check catches multi-step
+            # cycles (type password, type confirm, click submit, ...) that an
+            # immediate check cannot see — a rejected submit clears the
+            # passwords and the whole cycle recurs forever (measured).
+            if cycling:
+                note = ("These same actions have already been performed in the last few steps "
+                        "without completing the task — the site keeps rejecting them. Change "
+                        "strategy: read the page's error message, and type a DIFFERENT value "
+                        "into the field it complains about (e.g. a different username or email).")
+            elif sig == prev_sig:
+                note = ("The exact same action was just performed and the task is still not "
+                        "complete. Do not repeat it; choose a different operation or target.")
+            elif unchanged:
+                note = (f"The previous action ({cycle.get('action')}) did not change the page. "
+                        "Do not repeat it; choose a different operation or target.")
+            else:
+                note = None
+                prev_fingerprint = fingerprint(page)
+            prev_sig = sig
+            # Consecutive no-progress cycles (no-op skips, stale targets, empty
+            # action space) end the run only after 3 in a row — a single
+            # transient must not kill it (measured).
+            no_action_strikes = 0 if executed else no_action_strikes + 1
+            if no_action_strikes >= 3:
+                cycle["action"] = f"{cycle.get('action') or 'no progress'} (repeatedly)"
+                status = "blocked"
+                mx.clear_cache()
+                break
+            if args.headed:
+                page.wait_for_timeout(800)  # watchable pacing in the visible browser
+            mx.clear_cache()
+            if args.trace is not None:
+                # Crash-safe evidence: a run killed by a page race still leaves
+                # its full trace (create-only paths, overwritten per cycle).
+                args.trace.write_text(json.dumps(trace, indent=1) + "\n")
+        else:
+            status = "max_steps"
+
+        total_ms = round((time.perf_counter() - started) * 1000)
+        if status == "done" and (args.verify_text or args.verify_report):
+            print(f"verification PASS: page=/{args.verify_text}/ report=/{args.verify_report}/")
+        if status == "done" and not (args.verify_text or args.verify_report):
+            print("DONE (no verifier supplied; not verified)")
+            verified = False
+            trace["status"] = "done+unverified"
+        browser.close()
+
+    if trace.get("status") is None:
+        trace["status"] = status if status != "done" else ("done+verified" if verified else "done+unverified")
+    trace["total_ms_excluding_load"] = total_ms - round(load_s * 1000)
+    trace["total_ms"] = total_ms
+    if trace["status"].startswith("done"):
+        # The agent's voice: the final answer for read-and-report goals, built
+        # from the full action log and every page visited.
+        try:
+            report, raw = generate_report(model, tokenizer, args.goal, full_history, seen_pages)
+            trace["report_raw"] = raw.strip()[:400]
+            trace["report"] = report or ""
+            print(f"report: {report}")
+        except Exception as e:                     # a report must never mask a verified done
+            trace["report_error"] = f"{type(e).__name__}: {e}"[:200]
+    if args.trace is not None:
+        args.trace.write_text(json.dumps(trace, indent=1) + "\n")
+        print(f"trace: {args.trace}")
+    print(f"result: {trace['status']} in {trace['total_ms_excluding_load'] / 1000:.1f}s "
+          f"({len(trace['cycles'])} cycles, load {load_s:.0f}s excluded)")
+    return {"done+verified": 0, "done+unverified": 1}.get(trace["status"], 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

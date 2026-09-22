@@ -1,0 +1,317 @@
+#!/usr/bin/env -S uv run --script
+"""Rate files for security risk with Laya. Run: ./tools/is-safe <file-or-dir>...
+
+Each argument is a file, or a directory whose direct files are scanned.
+A single target prints a detailed report; multiple targets print one line each
+and are scanned in grouped GPU batches so large directories stay fast and
+memory-flat.
+
+Exit codes: 0 = all safe, 1 = any caution, 2 = any unsafe, 3 = error/nothing scanned.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import mlx.core as mx
+import numpy as np
+
+import laya_mlx as laya
+from laya_mlx.agent import collate_items
+from laya_mlx.common import temp_bucket
+
+# The runtime truncates each question's sequence to ~450 state tokens anyway
+# (build_sequence caps at max_len 512), so reading beyond ~4k chars is wasted work.
+MAX_CHARS = 4_000
+MAX_BYTES = 20 * 1024 * 1024   # skip files larger than this
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+VERDICT_COLOR = {"safe": "32", "caution": "33", "unsafe": "31"}
+
+# Benign-context preamble for the category question only. Measured effect: a
+# scary-word preamble poisons results; a benign one sharpens the attack/dev
+# split (the scare-preamble finding in reverse).
+BENIGN_PREAMBLE = (
+    "Security scan of a file from the user's own software development working "
+    "directory. Most files here are ordinary engineering artifacts: source "
+    "code, tests, SQL migrations, pull-request text, logs, configs and admin "
+    "scripts run by their owner. Flag only clear malicious behavior.\n\n"
+)
+
+# Questions over the raw file. Wording tuned on a 73-file labeled corpus;
+# victim-framed and archetype anchors beat abstract risk phrasing.
+QUESTIONS = {
+    "v_malware": {
+        "type": "score",
+        "instructions": "Does the content show a program deliberately built to harm the owner of the system that runs it?",
+        "criteria": ["ordinary material with no aim to harm its owner", "unclear", "clearly designed to harm the owner"],
+    },
+    "a_disguise": {
+        "type": "score",
+        "instructions": "Does the content hide or disguise itself (hidden files or names, fake system component names, base64-obfuscated chains, self-deletion)?",
+        "criteria": ["nothing hidden or disguised", "unclear", "clearly hides, impersonates or obfuscates itself"],
+    },
+    "a_payload": {
+        "type": "score",
+        "instructions": "Does the content contain or deliver a hidden malicious payload (cryptominer, keylogger, ransomware, rootkit, backdoor or self-copying worm)?",
+        "criteria": ["no such payload - ordinary software, SQL, config, logs, documents or data", "unclear", "a hidden malicious payload is present"],
+    },
+    "a_theft": {
+        "type": "score",
+        "instructions": "Does the content read the owner's secrets (passwords, SSH keys, cookies, tokens or keystrokes) to send them to someone else?",
+        "criteria": ["no - it only uses the owner's own data with the owner's own systems", "unclear", "yes - it ships the owner's secrets to a third party"],
+    },
+}
+
+# Category question over the benign-preamble state (separate prompt per row).
+CATEGORY = {
+    "type": "choice",
+    "instructions": "Which category best describes this content?",
+    "criteria": {
+        "dev": "normal engineering work: source, tests, migrations, docs, logs, config, benchmarks",
+        "ops": "benign administration, monitoring, backup or deployment tooling for the owner's own systems",
+        "attack": "built to steal data, damage, spy on, or break into systems",
+        "social": "attempts to trick a person into giving up secrets or access",
+    },
+}
+
+# Verdict rule, grid-searched on the labeled corpus (15 malicious / 58 benign):
+# unsafe = all three rule signals fire together (was: mean of seven axes).
+# This cut benign->unsafe flags from 37 to 3 while keeping the 13 baseline
+# malicious detections and upgrading one of the two baseline caution files.
+UNSAFE = {"v_malware": 0.75, "pcat_attack": 0.30, "a_disguise": 0.65}
+CAUTION = {"v_malware": 0.50, "pcat_attack": 0.20, "a_disguise": 0.55}  # >=2 of 3
+
+
+def read_state(path: Path) -> str:
+    if path.stat().st_size > MAX_BYTES:
+        raise ValueError(f"too large ({path.stat().st_size} bytes, limit {MAX_BYTES})")
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    printable = sum(32 <= ord(c) < 127 or c in "\n\r\t" for c in text[:4000])
+    if text and printable / min(len(text), 4000) < 0.7:
+        head = data[:2048].hex(" ", 1)
+        body = f"Binary file. First 2048 bytes as hex:\n{head}"
+    else:
+        body = text
+        if len(body) > MAX_CHARS:
+            body = f"{body[:MAX_CHARS]}\n(File truncated to the first {MAX_CHARS} of {len(text)} characters.)"
+    return f"File name: {path.name}\nFile size: {len(data)} bytes\n\n{body}"
+
+
+def verdict_from_signals(sig: dict) -> str:
+    if all(sig[k] >= v for k, v in UNSAFE.items()):
+        return "unsafe"
+    if sum(sig[k] >= v for k, v in CAUTION.items()) >= 2:
+        return "caution"
+    return "safe"
+
+
+def collect_targets(args) -> list[Path]:
+    """Expand arguments (files and/or directories) into a de-duplicated file list."""
+    targets: list[Path] = []
+    for arg in args:
+        path = Path(arg)
+        if path.is_dir():
+            targets.extend(
+                sorted(p for p in path.iterdir() if p.is_file() and p.name != ".DS_Store")
+            )
+        elif path.is_file():
+            targets.append(path)
+        else:
+            print(f"not a file or directory: {path}", file=sys.stderr)
+    return list(dict.fromkeys(targets))
+
+
+def clear_metal_cache():
+    try:
+        mx.clear_cache()
+    except AttributeError:
+        try:
+            mx.metal.clear_cache()
+        except Exception:
+            pass
+
+
+def _decode_row(logits_row, item, agent):
+    """One calibrated softmax over the row's option markers (Agent.system_one parity)."""
+    qt, k = item["qtype"], len(item["markers"])
+    scale = agent.temperature_by_options.get(temp_bucket(qt, k), agent.temperature[qt])
+    z = logits_row[:k] / max(1e-3, float(scale))
+    p = np.exp(z - z.max())
+    return p / p.sum()
+
+
+def scan_grouped(agent, targets, files_per_group=16, on_result=None, on_error=None):
+    """Scan many files with grouped forward passes.
+
+    Each file contributes 4 plain-state rows plus 1 preamble-state category row;
+    rows from `files_per_group` files share GPU batches. Decode mirrors
+    Agent.system_one. The Metal buffer cache is cleared between groups so
+    memory stays flat across thousands of files.
+    """
+    results: dict[Path, dict] = {}
+    group: list[tuple[Path, list]] = []
+
+    def items_for(path):
+        state = read_state(path)
+        plain_items, _ = agent.prepare(state, QUESTIONS)
+        cat_items, _ = agent.prepare(BENIGN_PREAMBLE + state, {"category": CATEGORY})
+        rows = [(q, it) for q, it in zip(QUESTIONS, plain_items)]
+        rows.append(("category", cat_items[0]))
+        return rows
+
+    def flush():
+        if not group:
+            return
+        items, owners = [], []
+        for path, rows in group:
+            for qname, item in rows:
+                items.append(item)
+                owners.append((path, qname))
+        for start in range(0, len(items), agent.batch_size):
+            chunk = items[start : start + agent.batch_size]
+            batch = collate_items(
+                chunk,
+                agent.tok.pad_token_id,
+                pad_to_multiple=agent.pad_to_multiple,
+                max_length=agent.cfg.get("max_len", 512),
+            )
+            logits, _ = agent.forward(batch)
+            logits = np.asarray(logits)
+            for row, item in enumerate(chunk):
+                path, qname = owners[start + row]
+                p = _decode_row(logits[row], item, agent)
+                if qname == "category":
+                    labels = list(CATEGORY["criteria"])
+                    results.setdefault(path, {})["pcat_attack"] = float(p[labels.index("attack")])
+                    results[path]["category"] = {
+                        lab: float(x) for lab, x in zip(labels, p)
+                    }
+                else:
+                    results.setdefault(path, {})[qname] = float(p[2])
+        clear_metal_cache()
+        for path, _ in group:
+            on_result(path, results[path])
+        group.clear()
+
+    for path in targets:
+        try:
+            rows = items_for(path)
+        except Exception as ex:
+            on_error(path, ex)
+            continue
+        group.append((path, rows))
+        if len(group) >= files_per_group:
+            flush()
+    flush()
+
+
+def colorize(verdict: str, text: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"\033[{VERDICT_COLOR[verdict]}m{text}\033[0m"
+
+
+def display(path: Path) -> str:
+    """Shortest unambiguous name: relative to cwd if under it, else absolute."""
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def report_detailed(path: Path, sig: dict) -> None:
+    verdict = verdict_from_signals(sig)
+    print(f"{path}\n")
+    for name in ("v_malware", "pcat_attack", "a_disguise", "a_payload", "a_theft"):
+        p = sig[name]
+        pct = p * 100
+        bar = "#" * round(pct / 5)
+        marks = ""
+        if name in UNSAFE:
+            hit = "U" if p >= UNSAFE[name] else " "
+            hit += "C" if p >= CAUTION[name] else " "
+            marks = f"  [{hit.strip() or '-'}]"
+        print(f"{name:13s} {pct:5.1f}%  {bar:<20s}{marks}")
+    cat = sig.get("category", {})
+    if cat:
+        catline = "  ".join(f"{k}={v:.2f}" for k, v in cat.items())
+        print(f"\ncategory:   {catline}")
+    fired = [k for k, v in UNSAFE.items() if sig[k] >= v]
+    print(f"verdict:    {colorize(verdict, verdict.upper())}"
+          f"  (rule signals fired: {', '.join(fired) or 'none'})")
+    if verdict == "caution":
+        print("review recommended; no clear malicious signal")
+    return verdict
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 3
+    targets = collect_targets(sys.argv[1:])
+    if not targets:
+        print("no files found to scan", file=sys.stderr)
+        return 3
+
+    agent = laya.load("aac6fef/laya-mlx", batch_size=32)
+
+    if len(targets) == 1:
+        path = targets[0]
+        results, errors = {}, {}
+
+        def on_result(p, sig):
+            results[p] = sig
+
+        def on_error(p, ex):
+            errors[p] = ex
+
+        scan_grouped(agent, targets, on_result=on_result, on_error=on_error)
+        if path in errors:
+            print(f"{path}: {errors[path]}", file=sys.stderr)
+            return 3
+        verdict = report_detailed(path, results[path])
+        return {"safe": 0, "caution": 1, "unsafe": 2}[verdict]
+
+    counts = {"safe": 0, "caution": 0, "unsafe": 0}
+    errors = skips = 0
+
+    def on_result(path, sig):
+        verdict = verdict_from_signals(sig)
+        counts[verdict] += 1
+        fired = [k for k, v in UNSAFE.items() if sig[k] >= v]
+        marks = " ".join(f"{k.replace('v_malware', 'mal').replace('pcat_attack', 'cat').replace('a_disguise', 'disg')}={sig[k]:.2f}"
+                         for k in ("v_malware", "pcat_attack", "a_disguise"))
+        badge = colorize(verdict, f"[{verdict.upper():7s}]")
+        print(f"{badge} {display(path)[:52]:52s} {marks}")
+
+    def on_error(path, ex):
+        nonlocal errors, skips
+        if "too large" in str(ex):
+            skips += 1
+            print(f"[SKIP    ] {display(path)[:52]:52s} {ex}")
+        else:
+            errors += 1
+            print(f"[ERROR   ] {display(path)[:52]:52s} {ex}")
+
+    print(f"scanning {len(targets)} files\n")
+    try:
+        scan_grouped(agent, targets, on_result=on_result, on_error=on_error)
+    except KeyboardInterrupt:
+        print("\ninterrupted; partial results above")
+    print(f"\n{counts['unsafe']} unsafe, {counts['caution']} caution, {counts['safe']} safe"
+          + (f", {skips} skipped" if skips else "")
+          + (f", {errors} errors" if errors else ""))
+    if counts["unsafe"]:
+        return 2
+    if counts["caution"]:
+        return 1
+    return 3 if errors and not counts["safe"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

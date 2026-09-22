@@ -1,0 +1,329 @@
+#!/usr/bin/env -S uv run --script
+"""Rate files for security risk with SemIf. Run: ./tools/is-safe <file-or-dir>...
+
+Port of laya-mlx's tools/is-safe to SemIf's typed readout. Each risk axis is a
+SemIf decision scored from answer-token logits in one forward pass per pass;
+the verdict is computed in code, never asked of the model. Two passes per file
+mirror the laya design: five score axes over the raw state in one shared
+batch, plus a category choice over a benign-framed preamble state.
+
+The verdict rule was grid-searched on the 2026-09-22 labeled corpus (15
+defanged malicious / 188 benign /tmp and repo files), not carried over from
+laya: unsafe = malware >= 0.75 AND category attack+social >= 0.85.
+
+Exit codes: 0 = all safe, 1 = any caution, 2 = any unsafe, 3 = error/nothing scanned.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import mlx.core as mx
+
+from semif_phase1 import mlx_backend
+
+MODEL = "Qwen/Qwen3.5-4B"
+REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+
+# SemIf enforces the prompt limit without truncation (encode_prompt rejects
+# rows past max_tokens), so the tool truncates file content itself. 4000 chars
+# keeps a typical source file inside the 4096-token default budget.
+MAX_CHARS = 4_000
+MAX_BYTES = 20 * 1024 * 1024
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+VERDICT_COLOR = {"safe": "32", "caution": "33", "unsafe": "31"}
+
+# Benign-context preamble for the category decision only. laya-mlx finding: a
+# scary-word preamble poisons results, a benign one sharpens the attack/dev
+# split. Untested on this model.
+BENIGN_PREAMBLE = (
+    "Security scan of a file from the user's own software development working "
+    "directory. Most files here are ordinary engineering artifacts: source "
+    "code, tests, SQL migrations, pull-request text, logs, configs and admin "
+    "scripts run by their owner. Flag only clear malicious behavior.\n\n"
+)
+
+# Score axes over the raw file: victim-framed instructions with descriptive
+# option anchors (the option description is the rubric anchor in SemIf).
+# Anchors echo the axis wording per axis — laya-mlx finding: descriptive
+# anchors beat generic ones by a wide margin. Wording carried over from
+# laya-mlx's corpus-tuned variants. a_deception was laya's dropped axis
+# (their 421M encoder scored a repo doc above a real phishing email); it is
+# re-tested here because the two baseline misses are undisguised phishing.
+UNCLEAR = {"id": "unclear", "description": "The evidence is unclear."}
+AXES = {
+    "v_malware": {
+        "question": "Does the content show a program deliberately built to harm the owner of the system that runs it?",
+        "options": [
+            {"id": "no", "description": "Ordinary material with no aim to harm its owner."},
+            UNCLEAR,
+            {"id": "yes", "description": "Clearly designed to harm the owner of the system that runs it."},
+        ],
+    },
+    "a_disguise": {
+        "question": "Does the content hide or disguise itself (hidden files or names, fake system component names, base64-obfuscated chains, self-deletion)?",
+        "options": [
+            {"id": "no", "description": "Nothing hidden or disguised."},
+            UNCLEAR,
+            {"id": "yes", "description": "Clearly hides, impersonates or obfuscates itself."},
+        ],
+    },
+    "a_payload": {
+        "question": "Does the content contain or deliver a hidden malicious payload (cryptominer, keylogger, ransomware, rootkit, backdoor or self-copying worm)?",
+        "options": [
+            {"id": "no", "description": "No such payload - ordinary software, SQL, config, logs, documents or data."},
+            UNCLEAR,
+            {"id": "yes", "description": "A hidden malicious payload is present."},
+        ],
+    },
+    "a_theft": {
+        "question": "Does the content read the owner's secrets (passwords, SSH keys, cookies, tokens or keystrokes) to send them to someone else?",
+        "options": [
+            {"id": "no", "description": "It only uses the owner's own data with the owner's own systems."},
+            UNCLEAR,
+            {"id": "yes", "description": "It ships the owner's secrets to a third party."},
+        ],
+    },
+    "a_deception": {
+        "question": "Does the content try to trick a person into revealing their passwords, recovery codes, or personal information?",
+        "options": [
+            {"id": "no", "description": "No trickery; it does not manipulate anyone into revealing secrets."},
+            UNCLEAR,
+            {"id": "yes", "description": "It manipulates a person into revealing their secrets or access."},
+        ],
+    },
+}
+
+# Category choice over the benign-preamble state (separate pass, as in laya).
+CATEGORY_OPTIONS = [
+    {"id": "dev", "description": "Normal engineering work: source, tests, migrations, docs, logs, config, benchmarks."},
+    {"id": "ops", "description": "Benign administration, monitoring, backup or deployment tooling for the owner's own systems."},
+    {"id": "attack", "description": "Built to steal data, damage, spy on, or break into systems."},
+    {"id": "social", "description": "Attempts to trick a person into giving up secrets or access."},
+]
+CATEGORY_QUESTION = "Which category best describes this content?"
+
+# Verdict rule, grid-searched offline on the 2026-09-22 corpus (15 defanged
+# malicious, 188 benign /tmp and repo files):
+#   unsafe  = malware >= 0.75 AND category attack+social >= 0.85
+#   caution = (malware >= 0.50 AND attack+social >= 0.50) OR deception >= 0.60
+# Measured margins: evil min mal 0.90 vs benign max 0.63; evil min harm 0.98
+# vs benign max 0.93; benign max deception 0.12 vs phishing 0.99. Disguise,
+# payload, and theft are report-only explanatory axes: with honest per-axis
+# anchors they are not near-universal on malware, so gating on them misses.
+UNSAFE_MAL, UNSAFE_HARM = 0.75, 0.85
+CAUTION_MAL, CAUTION_HARM, CAUTION_DECEP = 0.50, 0.50, 0.60
+
+
+def read_state(path: Path, max_chars: int) -> str:
+    if path.stat().st_size > MAX_BYTES:
+        raise ValueError(f"too large ({path.stat().st_size} bytes, limit {MAX_BYTES})")
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    printable = sum(32 <= ord(c) < 127 or c in "\n\r\t" for c in text[:4000])
+    if text and printable / min(len(text), 4000) < 0.7:
+        head = data[:1024].hex(" ", 1)
+        body = f"Binary file. First 1024 bytes as hex:\n{head}"
+    else:
+        body = text
+        if len(body) > max_chars:
+            body = f"{body[:max_chars]}\n(File truncated to the first {max_chars} of {len(text)} characters.)"
+    return f"File name: {path.name}\nFile size: {len(data)} bytes\n\n{body}"
+
+
+def verdict_from_signals(sig: dict) -> str:
+    if sig["v_malware"] >= UNSAFE_MAL and sig["pcat_harm"] >= UNSAFE_HARM:
+        return "unsafe"
+    if (sig["v_malware"] >= CAUTION_MAL and sig["pcat_harm"] >= CAUTION_HARM
+            or sig["a_deception"] >= CAUTION_DECEP):
+        return "caution"
+    return "safe"
+
+
+def collect_targets(args) -> list[Path]:
+    """Expand arguments (files and/or directories) into a de-duplicated file list."""
+    targets: list[Path] = []
+    for arg in args:
+        path = Path(arg)
+        if path.is_dir():
+            targets.extend(
+                sorted(p for p in path.iterdir() if p.is_file() and p.name != ".DS_Store")
+            )
+        elif path.is_file():
+            targets.append(path)
+        else:
+            print(f"not a file or directory: {path}", file=sys.stderr)
+    return list(dict.fromkeys(targets))
+
+
+def clear_metal_cache():
+    try:
+        mx.clear_cache()
+    except AttributeError:
+        try:
+            mx.metal.clear_cache()
+        except Exception:
+            pass
+
+
+def scan_file(agent, state: str) -> dict:
+    """Score one file: shared batch of the five axes, then the category pass.
+
+    Returns signal dict: p(yes) per axis, pcat_harm, and the full category
+    distribution. Verdict is computed by the caller, never by the model.
+    """
+    model, tokenizer, metadata = agent
+    rows = [
+        {"id": name, "state": state, "question": spec["question"], "options": spec["options"]}
+        for name, spec in AXES.items()
+    ]
+    axis_results, _ = mlx_backend.score_shared(model, tokenizer, rows, metadata)
+    sig = {}
+    for result in axis_results:
+        sig[result["id"]] = result["probabilities"][result["option_ids"].index("yes")]
+    category_row = {
+        "id": "category", "state": BENIGN_PREAMBLE + state,
+        "question": CATEGORY_QUESTION, "options": CATEGORY_OPTIONS,
+    }
+    cat = mlx_backend.score(model, tokenizer, category_row, metadata)
+    sig["pcat_attack"] = cat["probabilities"][cat["option_ids"].index("attack")]
+    sig["category"] = dict(zip(cat["option_ids"], cat["probabilities"]))
+    sig["pcat_harm"] = sig["category"].get("attack", 0.0) + sig["category"].get("social", 0.0)
+    clear_metal_cache()
+    return sig
+
+
+def colorize(verdict: str, text: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"\033[{VERDICT_COLOR[verdict]}m{text}\033[0m"
+
+
+def display(path: Path) -> str:
+    """Shortest unambiguous name: relative to cwd if under it, else absolute."""
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def report_detailed(path: Path, sig: dict) -> str:
+    verdict = verdict_from_signals(sig)
+    print(f"{path}\n")
+    rule = {"v_malware": (UNSAFE_MAL, CAUTION_MAL),
+            "pcat_harm": (UNSAFE_HARM, CAUTION_HARM),
+            "a_deception": (None, CAUTION_DECEP)}
+    for name in ("v_malware", "pcat_harm", "a_deception", "a_disguise", "a_payload", "a_theft"):
+        p = sig[name]
+        pct = p * 100
+        bar = "#" * round(pct / 5)
+        marks = ""
+        if name in rule:
+            hi, lo = rule[name]
+            hit = "U" if hi is not None and p >= hi else " "
+            hit += "C" if p >= lo else " "
+            marks = f"  [{hit.strip() or '-'}]"
+        print(f"{name:13s} {pct:5.1f}%  {bar:<20s}{marks}")
+    cat = sig.get("category", {})
+    if cat:
+        catline = "  ".join(f"{k}={v:.2f}" for k, v in cat.items())
+        print(f"\ncategory:   {catline}")
+    fired = [k for k, hi in (("v_malware", UNSAFE_MAL), ("pcat_harm", UNSAFE_HARM))
+             if sig[k] >= hi]
+    print(f"verdict:    {colorize(verdict, verdict.upper())}"
+          f"  (rule signals fired: {', '.join(fired) or 'none'})")
+    if verdict == "caution":
+        print("review recommended; no clear malicious signal")
+    print("\nrule calibrated 2026-09-22 on 15 malicious / 188 benign files")
+    return verdict
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("targets", nargs="+", metavar="FILE_OR_DIR")
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--revision", default=REVISION)
+    parser.add_argument("--max-chars", type=int, default=MAX_CHARS)
+    parser.add_argument("--dump-signals", type=Path,
+                        help="Write one JSON line per scored file with every axis/category "
+                             "probability (create-only) for offline rule fitting")
+    args = parser.parse_args()
+
+    targets = collect_targets(args.targets)
+    if not targets:
+        print("no files found to scan", file=sys.stderr)
+        return 3
+    dump = None
+    if args.dump_signals is not None:
+        if args.dump_signals.exists():
+            print(f"dump path exists: {args.dump_signals}", file=sys.stderr)
+            return 3
+        dump = args.dump_signals.open("w")
+
+    def record(path: Path, sig: dict, error: str | None = None):
+        if dump is not None:
+            dump.write(json.dumps({"path": str(path), "error": error, "signals": sig}) + "\n")
+
+    model, tokenizer, metadata = mlx_backend.load_model(args.model, args.revision)
+    agent = (model, tokenizer, metadata)
+
+    if len(targets) == 1:
+        path = targets[0]
+        try:
+            sig = scan_file(agent, read_state(path, args.max_chars))
+        except Exception as ex:
+            print(f"{path}: {ex}", file=sys.stderr)
+            return 3
+        finally:
+            if dump is not None:
+                dump.close()
+        record(path, sig)
+        verdict = report_detailed(path, sig)
+        return {"safe": 0, "caution": 1, "unsafe": 2}[verdict]
+
+    counts = {"safe": 0, "caution": 0, "unsafe": 0}
+    errors = skips = 0
+    print(f"scanning {len(targets)} files\n")
+    for path in targets:
+        try:
+            sig = scan_file(agent, read_state(path, args.max_chars))
+        except Exception as ex:
+            if "too large" in str(ex):
+                skips += 1
+                record(path, None, str(ex))
+                print(f"[SKIP    ] {display(path)[:52]:52s} {ex}")
+            else:
+                errors += 1
+                record(path, None, str(ex))
+                print(f"[ERROR   ] {display(path)[:52]:52s} {ex}")
+            continue
+        record(path, sig)
+        verdict = verdict_from_signals(sig)
+        counts[verdict] += 1
+        fired = [k for k, hi in (("v_malware", UNSAFE_MAL), ("pcat_harm", UNSAFE_HARM))
+                 if sig[k] >= hi]
+        marks = " ".join(
+            f"{k}={sig[k]:.2f}"
+            for k in ("v_malware", "pcat_harm", "a_deception")
+        )
+        badge = colorize(verdict, f"[{verdict.upper():7s}]")
+        print(f"{badge} {display(path)[:52]:52s} {marks}")
+    print(f"\n{counts['unsafe']} unsafe, {counts['caution']} caution, {counts['safe']} safe"
+          + (f", {skips} skipped" if skips else "")
+          + (f", {errors} errors" if errors else ""))
+    if dump is not None:
+        dump.close()
+    if counts["unsafe"]:
+        return 2
+    if counts["caution"]:
+        return 1
+    return 3 if errors and not counts["safe"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

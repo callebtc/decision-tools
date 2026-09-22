@@ -1,0 +1,13 @@
+[project]
+name = "laya-mlx-tools"
+version = "0.1.0"
+description = "Decision tools built on laya-mlx: is-safe, laya-bench, laya-agent"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "laya-mlx>=0.1",
+  "rich>=13",
+  "playwright>=1.49",
+]
+
+[tool.uv.sources]
+laya-mlx = { path = "../../laya-mlx", editable = true }
