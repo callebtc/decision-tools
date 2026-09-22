@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-laya-mlx = { path = "../../laya-mlx", editable = true }
+laya-mlx = { path = "vendor", editable = true }

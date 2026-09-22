@@ -888,7 +888,7 @@ wheels = [
 [[package]]
 name = "semif-phase1"
 version = "0.1.0"
-source = { editable = "../../Semif" }
+source = { editable = "vendor" }
 dependencies = [
     { name = "accelerate" },
     { name = "huggingface-hub" },
@@ -939,7 +939,7 @@ dependencies = [
 requires-dist = [
     { name = "playwright", specifier = ">=1.49" },
     { name = "rich", specifier = ">=13" },
-    { name = "semif-phase1", extras = ["mlx"], editable = "../../Semif" },
+    { name = "semif-phase1", extras = ["mlx"], editable = "vendor" },
 ]
 
 [[package]]

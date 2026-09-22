@@ -1,0 +1,6 @@
+[submodule "laya-mlx/vendor"]
+	path = laya-mlx/vendor
+	url = https://github.com/mizorewww/laya-mlx
+[submodule "Semif/vendor"]
+	path = Semif/vendor
+	url = https://github.com/TheoLeeCJ/SemIf

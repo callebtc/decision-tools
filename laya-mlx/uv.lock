@@ -187,7 +187,7 @@ wheels = [
 [[package]]
 name = "laya-mlx"
 version = "0.1.0"
-source = { editable = "../../laya-mlx" }
+source = { editable = "vendor" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -227,7 +227,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "laya-mlx", editable = "../../laya-mlx" },
+    { name = "laya-mlx", editable = "vendor" },
     { name = "playwright", specifier = ">=1.49" },
     { name = "rich", specifier = ">=13" },
 ]

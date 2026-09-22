@@ -1,7 +1,8 @@
 # decision-tools
 
-Scanners, benchmarks, and web agents built on [laya-mlx](../laya-mlx) and
-[Semif](../Semif). One self-contained uv project per sub dir:
+Scanners, benchmarks, and web agents built on
+[laya-mlx](laya-mlx/vendor) and [SemIf](Semif/vendor). One self-contained
+uv project per sub dir:
 
 ```
 laya-mlx/tools/   is-safe (scanner), laya-bench, laya-agent (+ demo html)
@@ -15,11 +16,11 @@ Each sub dir's own `README.md` has the detailed field notes.
 - [uv](https://docs.astral.sh/uv/) — builds each sub dir's environment
   (`.venv/`, pinned by the committed `uv.lock`). A suitable Python (<3.14)
   is picked automatically.
-- Sibling checkouts of the source projects, in the same parent directory
-  as this repo: each sub dir's `pyproject.toml` installs them as editable
-  sources, resolved relative to the sub dir (`../../laya-mlx` and
-  `../../Semif`). If they live elsewhere, edit the `[tool.uv.sources]`
-  path in the affected sub dir's `pyproject.toml`.
+- The source projects are vendored as git submodules (`laya-mlx/vendor`,
+  `Semif/vendor`), pinned to the exact revisions the tools were tuned
+  against; each sub dir's `pyproject.toml` installs them as editable
+  sources. After cloning, run `git submodule update --init` (or clone with
+  `--recurse-submodules`).
 - Google Chrome — the web agents drive an installed Chrome via Playwright's
   `channel="chrome"` (no `playwright install` needed).
 - Network on first run — model checkpoints download to the standard
@@ -29,6 +30,7 @@ Each sub dir's own `README.md` has the detailed field notes.
 ## Usage
 
 ```bash
+git submodule update --init          # once: checks out laya-mlx/ and Semif/vendor
 cd Semif                              # or: cd laya-mlx
 uv sync                              # once: builds .venv/ from uv.lock
 

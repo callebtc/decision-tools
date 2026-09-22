@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-semif-phase1 = { path = "../../Semif", editable = true }
+semif-phase1 = { path = "vendor", editable = true }
