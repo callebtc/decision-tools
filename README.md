@@ -1,30 +1,19 @@
 # decision-tools
 
-Scanners, benchmarks, and web agents built on [laya-mlx](laya-mlx/vendor)
-and [SemIf](Semif/vendor). One self-contained uv project per sub dir:
-
-```
-laya-mlx/tools/   is-safe (scanner), laya-bench, laya-agent (+ demo html)
-Semif/tools/      is-safe (scanner), semif-bench, semif-agent (+ demo html)
-```
-
-The source projects are vendored as git submodules (`laya-mlx/vendor`,
-`Semif/vendor`), pinned to the revisions the tools were tuned against and
-installed as editable sources by each sub dir's `pyproject.toml`. Everything
-lives inside this repo — no sibling checkouts needed.
-
-Each sub dir's own `README.md` has the detailed field notes.
+A collection of tools for building on [laya-mlx](laya-mlx/vendor) and
+[SemIf](Semif/vendor). Both source projects are vendored as git submodules
+(`laya-mlx/vendor`, `Semif/vendor`), pinned to the revisions the tools were
+tuned against and installed as editable sources by each sub dir's
+`pyproject.toml` — a single checkout is self-contained, no sibling
+checkouts needed.
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/) — builds each sub dir's environment
-  (`.venv/`, pinned by the committed `uv.lock`). A suitable Python (<3.14)
-  is picked automatically.
-- Google Chrome — the web agents drive an installed Chrome via Playwright's
+- [uv](https://docs.astral.sh/uv/) — picks a suitable Python (<3.14) itself.
+- Google Chrome — the agents drive an installed Chrome via Playwright's
   `channel="chrome"` (no `playwright install` needed).
-- Network on first run — model checkpoints download to the standard
-  Hugging Face cache (`~/.cache/huggingface/`, outside any repo):
-  421 MB for Laya, ~9 GB (Qwen3.5-4B) for SemIf.
+- Network on first run — model checkpoints download to the Hugging Face cache
+  (`~/.cache/huggingface/`, outside the repo): 421 MB Laya, ~9 GB SemIf.
 
 ## Setup from a fresh clone
 
@@ -53,23 +42,4 @@ uv run tools/semif-agent --demo           # from Semif/; --url/--goal for any pa
 
 The tools also run directly — `./tools/<name> …` (the shebangs do the same).
 
-## Reference
-
-Exit codes — `is-safe`: 0 safe / 1 caution / 2 unsafe / 3 error. Agents:
-0 done+verified / 1 done+unverified / 2 blocked or stalled / 3 error. Pass
-`--verify-text` for evidence-based success — without it DONE is never more
-than the gate's opinion.
-
-Notable flags:
-
-- `is-safe`: `--model`, `--revision`, `--max-chars`, `--dump-signals`
-- `laya-bench`: `--model`, `--dtype`, `--batch-size`
-- `semif-bench`: `--model`, `--revision`, `--iterations`, `--warmup`, `--max-tokens`
-- `laya-agent`: `--trace`, `--verify-text`, `--verify-report`, `--max-steps`,
-  `--headed`, `--snapshot-only`, `--model`, `--no-refine`, and `--llm` — the
-  text brain is one replaceable LLM command (default
-  `opencode run -m openrouter/z-ai/glm-5.3`; `ollama run <model>` for fully local)
-- `semif-agent`: `--trace`, `--verify-text`, `--max-steps`, `--headed`
-
-Note: `laya-bench --help` crashes on a literal `%` in one help string
-(`--compile`, needs `%%`); running the benchmark itself is unaffected.
+Details (exit codes, flags, field notes) are in each sub dir's `tools/README.md`.
